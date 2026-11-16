@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Hotmail / Outlook Account Checker — Telegram Bot
+HOTMAIL VALIDATE CHECKER — Telegram Bot
+Developer: @TheTalha47
 High-speed · Proxyless + Proxy · Inbox keywords · Daily free limit 5000
-Admin panel via buttons · All hits stored · Admin download clears bot
 """
 
 import os
 import re
+import sys
 import time
+import asyncio
 import sqlite3
 import logging
+import warnings
 import threading
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +30,7 @@ from telegram.ext import (
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore")
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("hmbot")
 
@@ -439,12 +443,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     used = get_daily_used(u.id)
     left = max(0, DAILY_LIMIT - used)
     text = (
-        f"👋 *Hotmail / Outlook Checker*\n\n"
+        f"*HOTMAIL VALIDATE CHECKER*\n"
+        f"Developer: @TheTalha47\n\n"
         f"User: `{u.id}`\n"
         f"Daily used: `{used}` / `{DAILY_LIMIT}`\n"
         f"Remaining: `{left}`\n\n"
         f"Proxyless · high speed · inbox keywords\n"
-        f"Send combos or use buttons below."
+        f"Use buttons below to start."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb(u.id))
 
@@ -799,8 +804,16 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_adm_dl, pattern="^adm_dl$"))
     app.add_handler(CallbackQueryHandler(cb_adm_clr_proxy, pattern="^adm_clr_proxy$"))
 
-    log.info("Bot starting…")
-    app.run_polling(drop_pending_updates=True)
+    log.info("HOTMAIL VALIDATE CHECKER starting | @TheTalha47")
+    # Python 3.10+ / Render: ensure event loop exists on main thread
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
